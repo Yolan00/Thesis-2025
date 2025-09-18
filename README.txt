@@ -16,4 +16,6 @@ Effects of Inference‐Level manipulation on Vision Language Models
 
 
 
-In this repository are the main codes used for my Master's thesis. Each code has a first comment section explaining the purpose and logic of the code, the datasets used are also uploaded as compressed folders.
+In this repository are the main codes used for my Master's thesis. 
+Each code has a first comment section explaining the purpose and logic of 
+the code, the datasets used are also uploaded as compressed folders.
