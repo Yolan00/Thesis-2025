@@ -1,0 +1,457 @@
+"""
+deep_baseline.py
+
+Baseline evaluation for a 4-image reference game using DeepSeek-VL2.
+
+Pipeline (per trial and per target index):
+  1) SPEAKER: Given 4 images and a target (1..4), generate a description that
+     helps a listener identify the target without mentioning its position.
+  2) LISTENER: Given the generated description and the same 4 images, predict
+     which image (first/second/third/fourth) is referred to.
+  3) PROBS: Capture next-token probabilities for lexicalized answer variants,
+     sum them per option to obtain cumulative probabilities, and record ranks.
+  4) LOGS: Append trial-level logs to a text file and store all speaker
+     descriptions (with outcomes) into a JSON file.
+  5) SUMMARY: Compute overall accuracy, description length stats, and ranked
+     probability stats split by CORRECT vs WRONG listener outcomes.
+
+Inputs
+------
+- DATASET_DIR: folder containing trial subfolders; each subfolder must
+  contain exactly 4 images (default ".jpg") and one CSV file named "trials_for_*.csv".
+  (CSV presence used as a sanity check; its content is not read here.)
+- MODEL_PATH: Hugging Face repo id or local checkpoint for DeepSeek-VL2.
+
+Outputs
+-------
+- OUTPUT_FILE (.txt): human-readable per-trial logs and an overall summary.
+- OUTPUT_FILE.replace(".txt", "_descriptions.json"): JSON list of speaker
+  descriptions with metadata and correctness labels.
+
+Notes
+-----
+- No sampling (do_sample=False) for deterministic behavior.
+- Listener probabilities are from the FIRST generated token only (next-token),
+  aggregated over tokenized variants (e.g., "first", " 1st", " 1", etc.) that
+  map to a single-token encoding.
+
+How to run
+----------
+$ python deep_baseline.py
+
+Dependencies
+------------
+- torch, transformers, PIL, deepseek_vl2 (DeepseekVLV2Processor, load_pil_images)
+"""
+
+import os
+import statistics
+import json
+from PIL import Image
+import torch
+import torch.nn.functional as F
+
+from deepseek_vl2.models import DeepseekVLV2Processor
+from transformers import AutoModelForCausalLM
+from deepseek_vl2.utils.io import load_pil_images
+
+# ----------------------------
+# Configuration
+# ----------------------------
+DATASET_DIR = "/projects/0/prjs1482/UvA/AA_DATASET/dataset"
+OUTPUT_FILE = "/projects/0/prjs1482/UvA/AA_PART_1/Baseline/DeepSeek/deepseek_baseline_output.txt"
+MODEL_PATH = "deepseek-ai/deepseek-vl2"
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+NUM_IMAGES = 4
+IMAGE_EXT = ".jpg"
+
+# ----------------------------
+# Variables/statistics
+# ----------------------------
+correct_count = 0
+wrong_count = 0
+total_count = 0
+trial_index = 0
+total_description_length = 0
+description_lengths = []
+
+# Max (rank-1) next-token cumulative probability when correct vs wrong
+prob_correct = []
+prob_wrong = []
+
+# Ranked cumulative probabilities split by correctness
+rank1_probs_correct, rank2_probs_correct, rank3_probs_correct, rank4_probs_correct = [], [], [], []
+rank1_probs_wrong,   rank2_probs_wrong,   rank3_probs_wrong,   rank4_probs_wrong   = [], [], [], []
+
+# Store per-trial speaker descriptions with metadata
+speaker_desc_records = []
+
+# ----------------------------
+# Load model and processor
+# ----------------------------
+print("Loading DeepSeek-VL2...")
+processor = DeepseekVLV2Processor.from_pretrained(MODEL_PATH)
+tokenizer = processor.tokenizer
+model = AutoModelForCausalLM.from_pretrained(MODEL_PATH, trust_remote_code=True)
+model = model.to(torch.bfloat16).to(DEVICE).eval()
+
+# ----------------------------
+# Helper functions
+# ----------------------------
+def load_images(image_paths):
+    """Load image paths as RGB PIL images.
+
+    Note: This helper is not used in the main loop because the pipeline uses
+    deepseek_vl2.utils.io.load_pil_images to parse 'conversation' dicts.
+    """
+    return [Image.open(p).convert("RGB") for p in image_paths]
+
+
+def find_csv_file(folder):
+    """Return path to a CSV file starting with 'trials_for_' in the folder, if any.
+
+    Used as a simple integrity check that a trial folder is complete.
+    """
+    for f in os.listdir(folder):
+        if f.endswith(".csv") and f.startswith("trials_for_"):
+            return os.path.join(folder, f)
+    return None
+
+
+def get_image_paths(folder, ext=IMAGE_EXT):
+    """Return sorted list of image file paths with the given extension."""
+    return sorted([os.path.join(folder, f) for f in os.listdir(folder) if f.endswith(ext)])
+
+
+def get_answer_variants():
+    """Lexicalized variants for the four options, including capitalization and numerals.
+
+    Only single-token variants will be used when mapping to token IDs.
+    """
+    return {
+        "first":  ["first", "First", "one", "One", "1", "1st", " 1", " 1st", " first", " First"],
+        "second": ["second", "Second", "two", "Two", "2", "2nd", " 2", " 2nd", " second", " Second"],
+        "third":  ["third", "Third", "three", "Three", "3", "3rd", " 3", " 3rd", " third", " Third"],
+        "fourth": ["fourth", "Fourth", "four", "Four", "4", "4th", " 4", " 4th", " fourth", " Fourth"],
+    }
+
+
+def get_all_variant_token_ids(tokenizer, answer_variants):
+    """Map each option to the set of single-token IDs for its variants.
+
+    We attempt encoding both with and without a leading space to capture
+    tokenizer behaviors where " first" and "first" differ.
+
+    Returns
+    -------
+    dict[str, set[int]]
+        Option -> set of token IDs for variants that encode to exactly 1 token.
+    """
+    variant_token_ids = {}
+    for key, variants in answer_variants.items():
+        token_ids = set()
+        for v in variants:
+            for prefix in ["", " "]:
+                ids = tokenizer.encode(prefix + v, add_special_tokens=False)
+                if len(ids) == 1:
+                    token_ids.add(ids[0])
+        variant_token_ids[key] = token_ids
+    return variant_token_ids
+
+
+def get_cumulative_probs(probs_full, variant_token_ids):
+    """Aggregate next-token probabilities over variants to get per-option totals.
+
+    Parameters
+    ----------
+    probs_full : torch.Tensor
+        Softmax probabilities over the full vocab for the next token.
+    variant_token_ids : dict[str, set[int]]
+        Option -> token IDs that realize that option as a single token.
+
+    Returns
+    -------
+    list[tuple[str, float]]
+        (option, cumulative_probability) sorted descending by probability.
+    """
+    cum_probs = {}
+    for ans, tids in variant_token_ids.items():
+        # Sum probabilities of all known single-token variants for this answer
+        prob = sum(float(probs_full[tid]) for tid in tids if tid < len(probs_full))
+        cum_probs[ans] = prob
+    sorted_items = sorted(cum_probs.items(), key=lambda x: -x[1])
+    return sorted_items
+
+# ----------------------------
+# Main trial
+# ----------------------------
+def run_trial(trial_path, target_idx):
+    """Run a single trial for a given target index (0..3).
+
+    Steps:
+      - Build a SPEAKER prompt to describe the target image.
+      - Generate a description (deterministic, max_new_tokens=64).
+      - Build a LISTENER prompt with the description + 4 images.
+      - Generate the answer token(s) and capture the FIRST generated token's
+        probability distribution (next-token).
+      - Aggregate probabilities over lexical variants to get per-option totals.
+      - Record correctness and append detailed logs.
+
+    Side effects:
+      - Mutates global counters and statistics lists.
+      - Appends to OUTPUT_FILE.
+
+    Parameters
+    ----------
+    trial_path : str
+        Path to a trial directory containing 4 images and a 'trials_for_*.csv'.
+    target_idx : int
+        0..3 for first..fourth target.
+    """
+    global trial_index, correct_count, wrong_count, total_count, total_description_length
+    global prob_correct, prob_wrong, description_lengths
+    global rank1_probs_correct, rank2_probs_correct, rank3_probs_correct, rank4_probs_correct
+    global rank1_probs_wrong, rank2_probs_wrong, rank3_probs_wrong, rank4_probs_wrong
+    global speaker_desc_records
+
+    trial_index += 1
+
+    # --- Validate trial folder contents ---
+    img_paths = get_image_paths(trial_path)
+    if len(img_paths) != NUM_IMAGES:
+        print(f"Skipping {trial_path}: expected {NUM_IMAGES} images, found {len(img_paths)}")
+        return
+
+    csv_path = find_csv_file(trial_path)
+    if not csv_path:
+        print(f"Skipping {trial_path}: no suitable .csv file found")
+        return
+
+    target_label = ['first', 'second', 'third', 'fourth'][target_idx]
+    target_img_name = os.path.basename(img_paths[target_idx])
+
+    # ---------------- SPEAKER TURN ----------------
+    # Constrained prompt: avoid revealing the position; ask for distinctive details.
+    speaker_prompt = (
+        f"<|grounding|> You are playing a reference game as the speaker. I will give you 4 different images. "
+        f"Image 1: <image>\n Image 2: <image>\n Image 3: <image>\n Image 4: <image>\n\n"
+        f"Generate a description of the {target_label} image so that the listener can identify it among the others, "
+        f"DO NOT MENTION that the image is the {target_label}. Never use the words 'first', 'second', 'third', or 'fourth'. "
+        f"To generate the description use the unique elements of the target image that distinguish it from the others. "
+    )
+    conversation = [
+        {
+            "role": "<|User|>",
+            "content": speaker_prompt,
+            "images": img_paths,
+        },
+        {"role": "<|Assistant|>", "content": ""}
+    ]
+
+    # Prepare multimodal inputs (images + text) for DeepSeek-VL2
+    pil_images = load_pil_images(conversation)
+    prepare_inputs = processor(
+        conversations=conversation,
+        images=pil_images,
+        force_batchify=True,
+        system_prompt=""
+    ).to(DEVICE)
+
+    # Deterministic generation of the description
+    with torch.no_grad():
+        inputs_embeds = model.prepare_inputs_embeds(**prepare_inputs)
+        outputs = model.generate(
+            inputs_embeds=inputs_embeds,
+            attention_mask=prepare_inputs.attention_mask,
+            pad_token_id=tokenizer.eos_token_id,
+            bos_token_id=tokenizer.bos_token_id,
+            eos_token_id=tokenizer.eos_token_id,
+            max_new_tokens=64,
+            do_sample=False,
+            use_cache=True
+        )
+
+    # Decode model output; skip special tokens to obtain the description text.
+    # Note: the full sequence includes the prompt; tokenizer handles stripping.
+    generated_desc = tokenizer.decode(outputs[0].cpu().tolist(), skip_special_tokens=True).strip()
+
+    # Track description length stats
+    total_description_length += len(generated_desc.split())
+    description_lengths.append(len(generated_desc.split()))
+    raw_speaker_prompt = speaker_prompt
+
+    # ---------------- LISTENER TURN ----------------
+    # Single call that both generates the guess and exposes next-token scores
+    listener_prompt = (
+        f"You are playing a reference game as the listener. Here is a description: \"{generated_desc}\"\n"
+        f"Which of the four images does this description refer to?\n"
+        f"first: <image>\n second: <image>\n third: <image>\n fourth: <image>\n\n"
+        f"Answer with one word: first, second, third, or fourth."
+    )
+    conversation_listener = [
+        {
+            "role": "<|User|>",
+            "content": listener_prompt,
+            "images": img_paths,
+        },
+        {"role": "<|Assistant|>", "content": ""}
+    ]
+    pil_images_listener = load_pil_images(conversation_listener)
+    prepare_inputs_listener = processor(
+        conversations=conversation_listener,
+        images=pil_images_listener,
+        force_batchify=True,
+        system_prompt=""
+    ).to(DEVICE)
+
+    with torch.no_grad():
+        inputs_embeds_listener = model.prepare_inputs_embeds(**prepare_inputs_listener)
+        outputs_listener = model.generate(
+            inputs_embeds=inputs_embeds_listener,
+            attention_mask=prepare_inputs_listener.attention_mask,
+            pad_token_id=tokenizer.eos_token_id,
+            bos_token_id=tokenizer.bos_token_id,
+            eos_token_id=tokenizer.eos_token_id,
+            max_new_tokens=10,
+            do_sample=False,
+            use_cache=True,
+            output_scores=True,           # expose next-token logits
+            return_dict_in_generate=True  # structured outputs
+        )
+
+    # Listener raw guess (decode); we also keep the raw prompt for logging.
+    listener_guess = tokenizer.decode(outputs_listener.sequences[0], skip_special_tokens=True).strip().lower()
+    raw_listener_prompt = listener_prompt
+
+    # Next-token probabilities from the FIRST generated token.
+    # scores[0] -> logits for the very first generated token.
+    logits = outputs_listener.scores[0]
+    probs_full = F.softmax(logits[0], dim=-1)
+
+    # Aggregate probabilities over lexical variants
+    answer_variants = get_answer_variants()
+    variant_token_ids = get_all_variant_token_ids(tokenizer, answer_variants)
+    cum_probs_table = get_cumulative_probs(probs_full, variant_token_ids)
+
+    # Max cumulative probability among the four options (rank-1 prob)
+    max_prob = max((prob for _, prob in cum_probs_table), default=0)
+
+    # Outcome and rank-wise bookkeeping
+    correct = listener_guess == target_label
+    result_text = "correct" if correct else "wrong"
+
+    # Extract the top-4 ranks (pad with zeros as needed)
+    ranks = [cum_probs_table[i][1] if i < len(cum_probs_table) else 0 for i in range(4)]
+    if correct:
+        prob_correct.append(max_prob)
+        rank1_probs_correct.append(ranks[0])
+        rank2_probs_correct.append(ranks[1])
+        rank3_probs_correct.append(ranks[2])
+        rank4_probs_correct.append(ranks[3])
+        correct_count += 1
+    else:
+        prob_wrong.append(max_prob)
+        rank1_probs_wrong.append(ranks[0])
+        rank2_probs_wrong.append(ranks[1])
+        rank3_probs_wrong.append(ranks[2])
+        rank4_probs_wrong.append(ranks[3])
+        wrong_count += 1
+
+    total_count += 1
+
+    # Record description with metadata for JSON export
+    speaker_desc_records.append({
+        "folder": os.path.basename(trial_path),
+        "target_label": target_label,
+        "target_img_name": target_img_name,
+        "description": generated_desc,
+        "listener_guess": listener_guess,
+        "correct": correct
+    })
+
+    # Console summary for the current trial
+    print("\n----------------------------------------")
+    print(f"Trial: {os.path.basename(trial_path)}")
+    print(f"Target image: {target_idx + 1} ({target_img_name})")
+    print(f"Generated description: {generated_desc}")
+    print(f"Listener guess: {listener_guess}")
+    print(f"Result: {result_text}")
+    print("----------------------------------------\n")
+
+    # Append detailed logs to the output text file
+    with open(OUTPUT_FILE, "a") as f:
+        f.write(f"=== TRIAL {trial_index} ===\n\n")
+        f.write(f"FOLDER: {os.path.basename(trial_path)}\n")
+        f.write(f"TARGET IMAGE: {target_img_name}, {target_label}\n\n")
+        f.write("[DESCRIPTION GENERATED]\n")
+        f.write(generated_desc + "\n\n")
+        f.write("[LISTENER GUESS]: " + listener_guess + "\n")
+        f.write("[RESULT]: " + result_text + "\n\n")
+        f.write("[LISTENER NEXT-TOKEN PROBABILITIES]\n")
+        f.write("Answer   | Cumulative Probability\n")
+        for ans, prob in cum_probs_table:
+            f.write(f"{ans:<8} | {prob:.4f}\n")
+        f.write("\n")
+        f.write("[RAW SPEAKER PROMPT]\n")
+        f.write(raw_speaker_prompt + "\n\n")
+        f.write("[RAW LISTENER PROMPT]\n")
+        f.write(raw_listener_prompt + "\n\n")
+        f.write("=" * 80 + "\n\n")
+
+# ----------------------------
+# Deterministic 4-pass navigation
+# ----------------------------
+if __name__ == "__main__":
+    # Enumerate trial folders once and loop target_idx = 0..3 (first..fourth)
+    all_folders = [d for d in sorted(os.listdir(DATASET_DIR)) if os.path.isdir(os.path.join(DATASET_DIR, d))]
+
+    for target_idx in range(NUM_IMAGES):  # 0,1,2,3 (first, second, ...)
+        print(f"\n======== CYCLE for TARGET INDEX {target_idx + 1} ========\n")
+        for folder in all_folders:
+            trial_path = os.path.join(DATASET_DIR, folder)
+            run_trial(trial_path, target_idx)
+
+    # ---------------- Overall summary/statistics ----------------
+    accuracy = correct_count / total_count * 100 if total_count > 0 else 0
+    avg_len = total_description_length / total_count if total_count > 0 else 0
+    std_len = statistics.stdev(description_lengths) if len(description_lengths) > 1 else 0
+
+    # Local helper for (mean, stdev) with empty-list safety
+    def _avgstd(L): return (statistics.mean(L) if L else 0, statistics.stdev(L) if len(L) > 1 else 0)
+
+    rank_stats = {
+        "rank1_correct": _avgstd(rank1_probs_correct),
+        "rank2_correct": _avgstd(rank2_probs_correct),
+        "rank3_correct": _avgstd(rank3_probs_correct),
+        "rank4_correct": _avgstd(rank4_probs_correct),
+        "rank1_wrong": _avgstd(rank1_probs_wrong),
+        "rank2_wrong": _avgstd(rank2_probs_wrong),
+        "rank3_wrong": _avgstd(rank3_probs_wrong),
+        "rank4_wrong": _avgstd(rank4_probs_wrong),
+    }
+
+    # Append summary to the output file
+    with open(OUTPUT_FILE, "a") as f:
+        f.write("=== OVERALL SUMMARY ===\n")
+        f.write(f"Total trials: {total_count}\n")
+        f.write(f"Correct:      {correct_count}\n")
+        f.write(f"Wrong:        {wrong_count}\n")
+        f.write(f"Accuracy:     {accuracy:.2f}%\n")
+        f.write(f"Avg Desc Len: {avg_len:.2f} ± {std_len:.2f} words\n")
+        f.write("Ranked answer probabilities (when correct):\n")
+        f.write(f"    1st most probable: {rank_stats['rank1_correct'][0]:.4f} ± {rank_stats['rank1_correct'][1]:.4f}\n")
+        f.write(f"    2nd most probable: {rank_stats['rank2_correct'][0]:.4f} ± {rank_stats['rank2_correct'][1]:.4f}\n")
+        f.write(f"    3rd most probable: {rank_stats['rank3_correct'][0]:.4f} ± {rank_stats['rank3_correct'][1]:.4f}\n")
+        f.write(f"    4th most probable: {rank_stats['rank4_correct'][0]:.4f} ± {rank_stats['rank4_correct'][1]:.4f}\n")
+        f.write("Ranked answer probabilities (when wrong):\n")
+        f.write(f"    1st most probable: {rank_stats['rank1_wrong'][0]:.4f} ± {rank_stats['rank1_wrong'][1]:.4f}\n")
+        f.write(f"    2nd most probable: {rank_stats['rank2_wrong'][0]:.4f} ± {rank_stats['rank2_wrong'][1]:.4f}\n")
+        f.write(f"    3rd most probable: {rank_stats['rank3_wrong'][0]:.4f} ± {rank_stats['rank3_wrong'][1]:.4f}\n")
+        f.write(f"    4th most probable: {rank_stats['rank4_wrong'][0]:.4f} ± {rank_stats['rank4_wrong'][1]:.4f}\n")
+        f.write("=" * 80 + "\n\n")
+
+    # Export JSON with all speaker descriptions and outcomes
+    with open(OUTPUT_FILE.replace(".txt", "_descriptions.json"), "w") as jf:
+        json.dump(speaker_desc_records, jf, indent=2)
+
+    print("DONE.")
